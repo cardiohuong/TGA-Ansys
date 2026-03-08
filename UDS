@@ -1,1 +1,136 @@
+/*============================================================
+ * UDF: Multi-Constituent Thrombus Deposition Model
+ * Based on: Wu et al., Scientific Reports 7:42720 (2017)
+ * Implemented as ANSYS Fluent User-Defined Scalars (UDS)
+ *
+ * UDS INDEX MAP (10 species):
+ *   UDS_0  = [RP]   Resting (unactivated) platelets       [PLT/m^3]
+ *   UDS_1  = [AP]   Activated platelets (free stream)     [PLT/m^3]
+ *   UDS_2  = [RPd]  Deposited resting platelets           [PLT/m^3]
+ *   UDS_3  = [APd]  Deposited activated platelets         [PLT/m^3]
+ *   UDS_4  = [APs]  Stabilized deposited platelets        [PLT/m^3]
+ *   UDS_5  = [apr]  PLT-released agonist (ADP)            [nmol/m^3]
+ *   UDS_6  = [aps]  PLT-synthesized agonist (TxA2)        [nmol/m^3]
+ *   UDS_7  = [PT]   Prothrombin                           [nmol/m^3]
+ *   UDS_8  = [TB]   Thrombin                              [U/m^3]
+ *   UDS_9  = [AT]   Anti-thrombin III (ATIII)             [nmol/m^3]
+ *
+ * FLOW: Solved via Navier-Stokes with Darcy resistance term
+ *       added via DEFINE_SOURCE on momentum equations.
+ *
+ * CODING STANDARDS:
+ *   - All parameters in SI unless noted (dyne/cm^2 for shear constants)
+ *   - Each DEFINE_* macro corresponds to exactly one physical mechanism
+ *   - Constants in ALL_CAPS at top of file; never hardcode in functions
+ *   - All source terms: positive = generation, negative = consumption
+ *   - Clamp concentrations to >= 0 before any rate computation
+ *   - Mesh-face divergence for k_rpd / k_apd computed via C_UDSI_G macro
+ *============================================================*/
+#include "udf.h"
+#include <math.h>
+
+/* --- Platelet diffusivity base (shear-dependent) --- */
+#define D_PLT_BASE      1.58e-13   /* [m^2/s] baseline platelet diffusivity */
+#define D_PLT_SHEAR     6.00e-13   /* [m^2/s/s^-1] shear-dependent coefficient */
+
+/* --- Chemical species diffusivities [m^2/s] --- */
+#define D_APR           2.57e-10   /* ADP */
+#define D_APS           2.14e-10   /* TxA2 */
+#define D_PT            3.32e-11   /* Prothrombin */
+#define D_TB            4.16e-11   /* Thrombin */
+#define D_AT            3.49e-11   /* ATIII */
+
+/* --- Platelet aggregation rate constants [m/s] --- */
+#define K_RA            3.0e-6     /* RP-APd aggregation rate */
+#define K_AA            3.0e-5     /* AP-APd aggregation rate */
+
+/* --- Agonist inhibition / synthesis rates --- */
+#define K1_TXA2         0.0161     /* [1/s] TxA2 inhibition rate */
+#define K1_ADP          0.0        /* [1/s] ADP inhibition rate */
+#define SP_TXA2         9.5e-12    /* [mol/PLT/s] TxA2 synthesis rate */
+#define SP_ADP          0.0        /* [mol/PLT/s] ADP synthesis rate */
+#define LAMBDA_ADP      2.4e-8     /* [mol/PLT] ADP released per platelet */
+
+/* --- Thrombin generation rates --- */
+#define PHI_AT          3.69e-15   /* [m^3/nmol/PLT/U/s] on activated platelets */
+#define PHI_RT          6.5e-16    /* [m^3/nmol/PLT/U/s] on resting platelets */
+#define EPSILON         9.11e-3    /* [mol/U] unit conversion NIH->SI */
+
+/* --- Griffith ATIII-Thrombin inhibition model parameters --- */
+#define K1T             13.333     /* [1/s] first-order rate constant */
+#define H_CONC          1.0e5      /* [nmol/m^3] heparin concentration */
+#define ALPHA           1.0        /* affinity factor */
+#define K_AT            1.0e5      /* [nmol/m^3] dissociation const heparin/ATIII */
+#define K_T             3.5e4      /* [nmol/m^3] dissociation const heparin/thrombin */
+
+/* --- Platelet geometry --- */
+#define DIA_PLT         2.78e-6    /* [m] hydraulic diameter of platelet */
+#define PLT_S_MAX       7.0e10     /* [PLT/m^2] max surface platelet capacity */
+#define PLT_MAX         (PLT_S_MAX / DIA_PLT)  /* [PLT/m^3] volumetric max */
+
+/* --- Shear-induced embolization --- */
+#define TAU_EMB         30.0       /* [dyne/cm^2] bulk embolization threshold */
+#define EMB_COEFF       0.0095     /* [cm^2/dyne] embolization shape coefficient */
+
+/* --- Agonist activation thresholds (Table 8) --- */
+#define AJ_CRIT_ADP     1.0e6      /* [nmol/m^3] */
+#define AJ_CRIT_TXA2    1.2e6      /* [nmol/m^3] */
+#define AJ_CRIT_TB      1.0e5      /* [U/m^3]    */
+#define W_ADP           1.0        /* agonist weight */
+#define W_TXA2          3.3        /* agonist weight */
+#define W_TB            30.0       /* agonist weight */
+
+/* --- Characteristic activation times --- */
+#define T_CT            1.0        /* [s] characteristic time kapa */
+#define T_ACT           0.3        /* [s] platelet activation duration */
+
+/* --- Thrombus resistance coefficient (Darcy drag) --- */
+#define C2_RESIST       2.0e9      /* [kg/m^3/s] */
+
+/* --- Boundary (surface) reaction rates: SET PER MATERIAL --- */
+/* Blood vessel (collagen/endothelium, Table 7):              */
+#define K_RPD_B_VESSEL  4.0e-5     /* [m/s] resting PLT-wall deposition    */
+#define K_APD_B_VESSEL  4.0e-4     /* [m/s] activated PLT-wall deposition  */
+#define TAU_EMBB_VESSEL 1.0        /* [dyne/cm^2] boundary embolization     */
+
+/* Titanium alloy Ti6Al4V (micro-crevice benchmark):         */
+#define K_RPD_B_TI      1.0e-20    /* [m/s] (essentially zero for RP)      */
+#define K_APD_B_TI      1.0e-5     /* [m/s]                                */
+#define TAU_EMBB_TI     0.1        /* [dyne/cm^2]                          */
+
+/* --- Initial / inlet conditions (human blood) --- */
+#define RP_INLET        2.5e14     /* [PLT/m^3] */
+#define AP_INLET        1.0e13     /* [PLT/m^3] */
+#define PT_INLET        1.1e6      /* [nmol/m^3] */
+#define AT_INLET        2.844e6    /* [nmol/m^3] */
+
+static real omega_agonist(real apr, real aps, real tb)
+{
+  real omega = 0.0;
+  omega += W_ADP * MAX(apr, 0.0) / AJ_CRIT_ADP);
+  omega += W_ADP * MAX(apr, 0.0) / AJ_CRIT_TXA2);
+  omega += W_ADP * MAX(apr, 0.0) / AJ_CRIT_TB;
+  return omega;
+}
+static real kapa_rate(real omega)
+{
+  if (omega < 1.0) return 0.0;
+  real base = 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
